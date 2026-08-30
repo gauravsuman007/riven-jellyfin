@@ -25,7 +25,7 @@ jobs:
         strategy:
             fail-fast: false
             matrix:
-                ref: [release, main]
+                ref: [newest-tag, main]
         steps:
             - uses: actions/checkout@v4
               with:
@@ -37,8 +37,14 @@ jobs:
                   GH_TOKEN: ${{ github.token }}
               run: |
                   set -euo pipefail
-                  if [ "${{ matrix.ref }}" = "release" ]; then
-                    REF=$(gh api "repos/${UPSTREAM}/releases" --jq 'map(select(.draft == false)) | .[0].tag_name')
+                  if [ "${{ matrix.ref }}" = "newest-tag" ]; then
+                    # Matches the build workflow: releases are stale and the
+                    # newest one cannot even be built. See the comment there.
+                    REF=$(gh api "repos/${UPSTREAM}/tags?per_page=15" --jq '.[].name' \
+                          | while read -r t; do
+                              d=$(gh api "repos/${UPSTREAM}/commits/$t" --jq '.commit.committer.date' 2>/dev/null) || continue
+                              echo "$d $t"
+                            done | sort -r | head -1 | cut -d' ' -f2)
                   else
                     REF=$(gh api "repos/${UPSTREAM}" --jq .default_branch)
                   fi

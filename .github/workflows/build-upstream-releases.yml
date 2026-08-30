@@ -51,15 +51,34 @@ jobs:
 
                   TAG="${{ inputs.tag }}"
                   if [ -z "$TAG" ]; then
-                    # The list endpoint rather than releases/latest, which
-                    # excludes prereleases. Riven's active line has been
-                    # prereleases before, and a silent fall back to a
-                    # months-old tag whose layout the patch does not fit cost
-                    # real time on the frontend fork. Newest-first; drafts
-                    # skipped because they have no buildable tag.
-                    TAG=$(gh api "repos/${UPSTREAM}/releases" \
-                            --jq 'map(select(.draft == false)) | .[0].tag_name')
+                    # TAGS, not releases -- and this is not a preference.
+                    #
+                    # Riven's newest published RELEASE is v0.23.6 (Aug 2025)
+                    # and it cannot be built at all: it pins
+                    #   plexapi = {git = ".../python-plexapi", rev = "bef199e4"}
+                    # and that commit is no longer reachable from any ref, so
+                    # poetry fails with "verify ref exists on remote". Upstream
+                    # moved to the PyPI package afterwards. Following releases
+                    # would therefore pin this fork to a year-old tag that
+                    # never builds, which is exactly how the first run failed.
+                    #
+                    # Tags carry the active line (v1.0.0-beta.*), matching
+                    # riven-frontend-jellyfin. GitHub does not guarantee tag
+                    # ordering, so they are sorted by COMMIT DATE rather than
+                    # trusted as returned. Bounded to 15 to keep this to a
+                    # handful of API calls.
+                    TAG=$(gh api "repos/${UPSTREAM}/tags?per_page=15" --jq '.[].name' \
+                          | while read -r t; do
+                              d=$(gh api "repos/${UPSTREAM}/commits/$t" --jq '.commit.committer.date' 2>/dev/null) || continue
+                              echo "$d $t"
+                            done | sort -r | head -1 | cut -d' ' -f2)
                   fi
+
+                  if [ -z "$TAG" ]; then
+                    echo "::error::could not resolve an upstream tag"
+                    exit 1
+                  fi
+
                   echo "upstream tag: $TAG"
                   echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
