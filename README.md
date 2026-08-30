@@ -29,6 +29,7 @@ Three edits, ten lines, plus one new file:
 | File | Change |
 | --- | --- |
 | `services/downloaders/torbox.py` | the provider (new file) |
+| `services/downloaders/uncached.py` | the opt-in uncached-request logic (new file) |
 | `settings/models.py` | `TorBoxModel` + a `torbox` field on `DownloadersModel` |
 | `services/downloaders/models.py` | `"torbox"` added to the `UserInfo.service` literal |
 | `services/downloaders/__init__.py` | import and register `TorBoxDownloader` |
@@ -55,17 +56,31 @@ its own — and `getServiceDisplayName` in the frontend already maps `torbox` to
 "TorBox", left over from when Riven shipped it. Verified in the frontend source
 rather than assumed.
 
-## Known limitation: cached content only
+## Requesting uncached releases (opt-in)
 
-TorBox reports an uncached torrent as *queued*, which this provider raises as
-`TorBoxQueued`. Upstream's downloader loop has no concept of waiting for a
-provider to finish caching, so such a stream is treated as failed on TorBox and
-the next candidate is tried.
+Upstream only downloads what a provider already holds: a stream with no
+container is skipped, and once every service has skipped it, **blacklisted**.
+For a library whose releases are rarely cached, that means the item scrapes
+fine, every candidate is discarded, and it sits at `Scraped` forever with
+nothing in the log saying why.
 
-That is the right behaviour for mainstream media, where cached is the common
-case. It is **not** enough for libraries whose releases are rarely cached —
-porting the wait-and-poll machinery means real surgery on upstream's downloader
-loop, which an anchored patch cannot do safely. Tracked, not hidden.
+With `download_uncached` on, a run that finds nothing cached asks the provider
+to start fetching the best candidate and reschedules the item. Providers cache
+asynchronously, so the next run finds it through the ordinary availability
+check and downloads it with no special handling — which is why there is no
+second download path here.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `download_uncached` | `false` | Ask providers to fetch releases they have not cached |
+| `uncached_poll_minutes` | `10` | How long before re-checking |
+| `uncached_max_wait_hours` | `24` | When to give up, so a dead release cannot reschedule forever |
+
+**Off by default, and inert when off.** Every insertion into the download loop
+is guarded, and `request()` returns `None` immediately when the setting is
+false, so the loop executes exactly the instructions it did before. That is a
+promise a guarded diff cannot demonstrate by eye, so `test/test_uncached.py`
+asserts it directly and CI additionally checks the guards are still in place.
 
 ## Maintenance
 

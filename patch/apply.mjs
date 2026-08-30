@@ -60,10 +60,12 @@ function edit(relative, describe, transform) {
 
 // --- 1. the provider itself ------------------------------------------------
 
-const target = join(upstream, "src/program/services/downloaders/torbox.py");
-mkdirSync(dirname(target), { recursive: true });
-copyFileSync(join(here, "files/src/program/services/downloaders/torbox.py"), target);
-console.log("  copied src/program/services/downloaders/torbox.py");
+for (const name of ["torbox.py", "uncached.py"]) {
+    const target = join(upstream, "src/program/services/downloaders", name);
+    mkdirSync(dirname(target), { recursive: true });
+    copyFileSync(join(here, "files/src/program/services/downloaders", name), target);
+    console.log(`  copied src/program/services/downloaders/${name}`);
+}
 
 // --- 2. settings -----------------------------------------------------------
 
@@ -96,6 +98,21 @@ ${modelAnchor}`
         match[1],
         `${match[1]}    torbox: TorBoxModel = Field(
         default_factory=lambda: TorBoxModel(), description="TorBox configuration"
+    )
+    download_uncached: bool = Field(
+        default=False,
+        description=(
+            "Ask the debrid provider to fetch a release it has not cached, "
+            "instead of skipping it. Off by default: it holds an item open "
+            "across several runs and is only worth it for content that is "
+            "rarely cached."
+        ),
+    )
+    uncached_poll_minutes: int = Field(
+        default=10, ge=1, description="How long to wait before re-checking an uncached request"
+    )
+    uncached_max_wait_hours: int = Field(
+        default=24, ge=1, description="How long to keep waiting before giving up on an uncached release"
     )
 `
     );
@@ -143,6 +160,113 @@ edit("src/program/services/downloaders/__init__.py", "registered TorBoxDownloade
     return source.replace(
         registryAnchor,
         `${registryAnchor}\n            TorBoxDownloader: TorBoxDownloader(),`
+    );
+});
+
+// --- 5. request uncached releases (opt-in) ---------------------------------
+
+edit("src/program/services/downloaders/__init__.py", "wired the uncached-request path", (source, bad) => {
+    if (source.includes("uncached_requests")) return null;
+
+    /*
+        EVERY insertion below is guarded on the setting, so with
+        download_uncached off (the default) the loop executes exactly the
+        instructions it did before. That is the whole contract of this edit:
+        it adds a path, it does not alter one.
+    */
+    const importAnchor = "from .torbox import TorBoxDownloader";
+
+    if (!source.includes(importAnchor)) bad("expected the TorBox import to be in place first");
+
+    source = source.replace(importAnchor, `${importAnchor}\nfrom .uncached import uncached_requests`);
+
+    // (a) Remember a stream the provider does not hold.
+    const skipAnchor = `                        if not container:
+                            logger.debug(
+                                f"Stream {stream.infohash} not available on {service.key}"
+                            )
+                            continue`;
+
+    if (!source.includes(skipAnchor)) bad("could not find the not-available skip");
+
+    source = source.replace(
+        skipAnchor,
+        `                        if not container:
+                            logger.debug(
+                                f"Stream {stream.infohash} not available on {service.key}"
+                            )
+
+                            # Not cached is not the same as not usable, once
+                            # the provider is allowed to go and fetch it.
+                            if uncached_requests.enabled() and stream not in uncached_candidates:
+                                uncached_candidates.append(stream)
+
+                            continue`
+    );
+
+    // (b) Do not blacklist a stream we intend to ask for.
+    const blacklistAnchor = `                        logger.debug(
+                            f"Stream {stream.infohash} failed on all {len(available_services)} available service(s), blacklisting"
+                        )
+                        item.blacklist_stream(stream)`;
+
+    if (!source.includes(blacklistAnchor)) bad("could not find the blacklist call");
+
+    source = source.replace(
+        blacklistAnchor,
+        `                        # A merely-uncached stream must survive: blacklisting
+                        # it here is exactly what leaves an item stuck at Scraped
+                        # with every candidate discarded and nothing saying why.
+                        if uncached_requests.enabled() and stream in uncached_candidates:
+                            logger.debug(
+                                f"Stream {stream.infohash} is uncached; keeping it as a fetch candidate"
+                            )
+                        else:
+                            logger.debug(
+                                f"Stream {stream.infohash} failed on all {len(available_services)} available service(s), blacklisting"
+                            )
+                            item.blacklist_stream(stream)`
+    );
+
+    // (c) Declare the accumulator next to the loop's other counters.
+    const counterAnchor = "            tried_streams = 0\n\n            for stream in sorted_streams:";
+
+    if (!source.includes(counterAnchor)) bad("could not find the tried_streams counter");
+
+    source = source.replace(
+        counterAnchor,
+        `            tried_streams = 0
+            # Streams no provider holds yet. Only ever populated when
+            # download_uncached is on.
+            uncached_candidates: list[Stream] = []
+
+            for stream in sorted_streams:`
+    );
+
+    // (d) Ask for one, and come back later.
+    const failAnchor = `                logger.debug(
+                    f"Failed to download any streams for {item.log_string} ({item.id})"
+                )`;
+
+    if (!source.includes(failAnchor)) bad("could not find the failure log");
+
+    return source.replace(
+        failAnchor,
+        `                # Nothing cached anywhere. Ask a provider to fetch the
+                # best candidate and look again shortly; providers cache
+                # asynchronously, so the next run finds it through the ordinary
+                # availability check with no special handling.
+                retry_at = uncached_requests.request(
+                    item, uncached_candidates, available_services
+                )
+
+                if retry_at is not None:
+                    yield RunnerResult(media_items=[item], run_at=retry_at)
+                    return
+
+                logger.debug(
+                    f"Failed to download any streams for {item.log_string} ({item.id})"
+                )`
     );
 });
 

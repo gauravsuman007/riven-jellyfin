@@ -19,6 +19,19 @@ env:
     UPSTREAM: rivenmedia/riven
 
 jobs:
+    unit:
+        name: Uncached-request tests
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-python@v5
+              with:
+                  python-version: "3.13"
+            # Runs against the patch's own module with upstream stubbed, so it
+            # needs no checkout and covers the one thing a diff cannot show by
+            # eye: that the feature is genuinely inert when switched off.
+            - run: python3 test/test_uncached.py
+
     apply:
         name: Apply to ${{ matrix.ref }}
         runs-on: ubuntu-latest
@@ -108,6 +121,13 @@ jobs:
                   PY
 
                   grep -q "TorBoxDownloader: TorBoxDownloader()" src/program/services/downloaders/__init__.py
+
+                  # The uncached path must stay behind its guard. If an edit
+                  # ever lands it unguarded, the feature would change the
+                  # downloader's behaviour for everyone, which is the one thing
+                  # it promises not to do.
+                  grep -q "uncached_requests.enabled()" src/program/services/downloaders/__init__.py
+                  test "$(grep -c 'uncached_requests.enabled()' src/program/services/downloaders/__init__.py)" -ge 2
 
                   # UserInfo.service must ACCEPT "torbox". This is a runtime
                   # pydantic Literal, so py_compile and an import check both
