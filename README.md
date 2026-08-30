@@ -30,7 +30,17 @@ Three edits, ten lines, plus one new file:
 | --- | --- |
 | `services/downloaders/torbox.py` | the provider (new file) |
 | `settings/models.py` | `TorBoxModel` + a `torbox` field on `DownloadersModel` |
+| `services/downloaders/models.py` | `"torbox"` added to the `UserInfo.service` literal |
 | `services/downloaders/__init__.py` | import and register `TorBoxDownloader` |
+
+That third edit is the one that is easy to miss and impossible to catch
+statically. `UserInfo.service` is a pydantic `Literal` of upstream's three
+providers; TorBox returning `"torbox"` fails validation, so `get_user_info`
+raises, `_validate_premium` fails, the provider never initialises, and Riven
+reports **"No Downloader service initialized"** with the real cause buried in a
+pydantic error several lines earlier. `py_compile` and an import check both
+pass, because a `Literal` is only enforced when the model is constructed. CI
+now asserts it explicitly.
 
 Every edit is anchored to text that must already exist, and a missing anchor
 **fails the build**. Publishing an image whose TorBox support silently did not

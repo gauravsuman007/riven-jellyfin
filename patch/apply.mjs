@@ -101,7 +101,31 @@ ${modelAnchor}`
     );
 });
 
-// --- 3. register the downloader -------------------------------------------
+// --- 3. let UserInfo name TorBox ------------------------------------------
+
+edit("src/program/services/downloaders/models.py", 'added "torbox" to the UserInfo service literal', (source, bad) => {
+    if (source.includes('"alldebrid", "torbox"')) return null;
+
+    /*
+        A RUNTIME failure, invisible to any static check.
+
+        `UserInfo.service` is a pydantic Literal of the three providers
+        upstream ships. TorBox returning "torbox" fails validation, so
+        get_user_info raises, _validate_premium fails, the provider never
+        initialises, and Riven reports "No Downloader service initialized" --
+        with the real cause buried in a pydantic error several lines earlier.
+
+        Found only by deploying: py_compile and an import check both pass,
+        because the literal is only enforced when a UserInfo is constructed.
+    */
+    const anchor = 'service: Literal["realdebrid", "debridlink", "alldebrid"]';
+
+    if (!source.includes(anchor)) bad("could not find the UserInfo service literal");
+
+    return source.replace(anchor, 'service: Literal["realdebrid", "debridlink", "alldebrid", "torbox"]');
+});
+
+// --- 4. register the downloader -------------------------------------------
 
 edit("src/program/services/downloaders/__init__.py", "registered TorBoxDownloader", (source, bad) => {
     if (source.includes("TorBoxDownloader")) return null;

@@ -108,4 +108,25 @@ jobs:
                   PY
 
                   grep -q "TorBoxDownloader: TorBoxDownloader()" src/program/services/downloaders/__init__.py
+
+                  # UserInfo.service must ACCEPT "torbox". This is a runtime
+                  # pydantic Literal, so py_compile and an import check both
+                  # pass while the provider fails on first use: get_user_info
+                  # raises a validation error, _validate_premium fails, and
+                  # Riven reports "No Downloader service initialized" with the
+                  # real cause buried several lines up. Found by deploying,
+                  # which is exactly the feedback loop this check replaces.
+                  python3 - <<'PY'
+                  import ast
+                  tree = ast.parse(open("src/program/services/downloaders/models.py").read())
+                  lit = None
+                  for node in ast.walk(tree):
+                      if isinstance(node, ast.ClassDef) and node.name == "UserInfo":
+                          for stmt in node.body:
+                              if isinstance(stmt, ast.AnnAssign) and getattr(stmt.target, "id", None) == "service":
+                                  lit = [e.value for e in stmt.annotation.slice.elts]
+                  assert lit and "torbox" in lit, f"UserInfo.service does not accept torbox: {lit}"
+                  print("UserInfo.service accepts:", lit)
+                  PY
+
                   echo "verified"
