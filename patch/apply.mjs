@@ -272,8 +272,15 @@ edit("src/program/services/downloaders/__init__.py", "wired the uncached-request
 
 // --- 6. restore the add-torrent fallback ----------------------------------
 
+/** Inserted verbatim, and used as this edit's idempotency guard. */
+const ADD_TORRENT_MARKER = "riven-jellyfin: no torrent id on the container";
+
 edit("src/program/services/downloaders/__init__.py", "restored the missing add_torrent fallback", (source, bad) => {
-    if (source.includes("no torrent id on the container")) return null;
+    // Guarded on a marker inserted verbatim below. The previous guard used a
+    // different capitalisation from the comment it was checking for, so it
+    // never matched: the edit re-ran on an already-patched file, failed to
+    // find its anchor, and took CI down as "upstream changed".
+    if (source.includes(ADD_TORRENT_MARKER)) return null;
 
     /*
         UPSTREAM BUG, and it breaks downloading entirely -- for every
@@ -321,11 +328,11 @@ edit("src/program/services/downloaders/__init__.py", "restored the missing add_t
                 f"Reusing torrent_id {torrent_id} from validation for {stream.infohash}"
             )
         else:
-            # No torrent id on the container, which is the normal case: no
-            # provider sets one. Add the torrent to obtain it, as this
-            # method's own docstring describes. Without this the bare assert
-            # below fires with an empty message and every cached stream is
-            # blacklisted.
+            # riven-jellyfin: no torrent id on the container, which is the
+            # normal case -- no provider sets one. Add the torrent to obtain
+            # it, as this method's own docstring describes. Without this the
+            # bare assert below fires with an empty message and every cached
+            # stream is blacklisted.
             torrent_id = service.add_torrent(stream.infohash)
 
             logger.debug(
