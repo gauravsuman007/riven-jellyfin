@@ -122,6 +122,14 @@ jobs:
 
                   grep -q "TorBoxDownloader: TorBoxDownloader()" src/program/services/downloaders/__init__.py
 
+                  # The add_torrent fallback must be present, or downloading is
+                  # broken for every provider: the bare `assert torrent_id`
+                  # fires with an empty message, every cached stream is
+                  # blacklisted, and items sit at Indexed while the log shows a
+                  # successful scrape.
+                  grep -q "no torrent id on the container" src/program/services/downloaders/__init__.py
+                  grep -q "service.add_torrent(stream.infohash)" src/program/services/downloaders/__init__.py
+
                   # The uncached path must stay behind its guard. If an edit
                   # ever lands it unguarded, the feature would change the
                   # downloader's behaviour for everyone, which is the one thing

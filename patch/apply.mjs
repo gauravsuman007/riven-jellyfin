@@ -270,4 +270,71 @@ edit("src/program/services/downloaders/__init__.py", "wired the uncached-request
     );
 });
 
+// --- 6. restore the add-torrent fallback ----------------------------------
+
+edit("src/program/services/downloaders/__init__.py", "restored the missing add_torrent fallback", (source, bad) => {
+    if (source.includes("no torrent id on the container")) return null;
+
+    /*
+        UPSTREAM BUG, and it breaks downloading entirely -- for every
+        provider, not just TorBox.
+
+        `download_cached_stream_on_service` takes the torrent id from
+        `container.torrent_id`, which its own docstring says is populated
+        "otherwise adds the torrent and/or fetches its info from the service".
+        That fallback does not exist in the file. And NO provider sets
+        `torrent_id` on the container -- not realdebrid, alldebrid,
+        debridlink or torbox -- so `torrent_id` is always None and the bare
+        `assert torrent_id` below fires.
+
+        A bare assert raises AssertionError with an EMPTY message, which the
+        download loop catches and logs as "Stream <hash> failed on <service>: "
+        with nothing after the colon. Every cached stream is then blacklisted,
+        the item ends with zero usable streams, and it sits at Indexed forever
+        while the log shows a successful scrape. Observed exactly that way:
+        7 streams found for a film, 7 blacklisted, 0 attached.
+
+        Adding the torrent is what yields an id, and is what the docstring
+        describes.
+    */
+    const anchor = `        torrent_id = None
+
+        # Check if we already have a torrent_id from validation (Real-Debrid optimization)
+        if container.torrent_id:
+            torrent_id = container.torrent_id
+
+            logger.debug(
+                f"Reusing torrent_id {torrent_id} from validation for {stream.infohash}"
+            )
+
+        assert torrent_id`;
+
+    if (!source.includes(anchor)) bad("could not find the torrent_id assert block");
+
+    const replacement = `        torrent_id = None
+
+        # Check if we already have a torrent_id from validation (Real-Debrid optimization)
+        if container.torrent_id:
+            torrent_id = container.torrent_id
+
+            logger.debug(
+                f"Reusing torrent_id {torrent_id} from validation for {stream.infohash}"
+            )
+        else:
+            # No torrent id on the container, which is the normal case: no
+            # provider sets one. Add the torrent to obtain it, as this
+            # method's own docstring describes. Without this the bare assert
+            # below fires with an empty message and every cached stream is
+            # blacklisted.
+            torrent_id = service.add_torrent(stream.infohash)
+
+            logger.debug(
+                f"Added {stream.infohash} to {service.key} as torrent {torrent_id}"
+            )
+
+        assert torrent_id`;
+
+    return source.replace(anchor, replacement);
+});
+
 console.log("\npatch applied.\n");

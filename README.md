@@ -32,7 +32,25 @@ Three edits, ten lines, plus one new file:
 | `services/downloaders/uncached.py` | the opt-in uncached-request logic (new file) |
 | `settings/models.py` | `TorBoxModel` + a `torbox` field on `DownloadersModel` |
 | `services/downloaders/models.py` | `"torbox"` added to the `UserInfo.service` literal |
-| `services/downloaders/__init__.py` | import and register `TorBoxDownloader` |
+| `services/downloaders/__init__.py` | import and register `TorBoxDownloader`, plus the fixes below |
+
+### The download path is broken upstream, for every provider
+
+`download_cached_stream_on_service` reads the torrent id from
+`container.torrent_id` and its docstring says it "otherwise adds the torrent
+and/or fetches its info from the service" — **that fallback is not in the
+file**, and *no* provider sets `torrent_id` on the container (not realdebrid,
+alldebrid, debridlink or torbox). So `torrent_id` is always `None` and the bare
+`assert torrent_id` fires.
+
+A bare assert raises `AssertionError` with an **empty message**, which the
+download loop catches and logs as `Stream <hash> failed on <service>: ` with
+nothing after the colon. Every cached stream is then blacklisted, the item ends
+with zero usable streams, and it sits at `Indexed` forever while the log shows a
+perfectly successful scrape. Seen on a real request: 7 streams found, 7
+blacklisted, 0 attached.
+
+The patch restores the documented fallback — add the torrent to get an id.
 
 That third edit is the one that is easy to miss and impossible to catch
 statically. `UserInfo.service` is a pydantic `Literal` of upstream's three
