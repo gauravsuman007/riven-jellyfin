@@ -1,0 +1,105 @@
+name: Verify the patch applies
+
+# The patch is anchored to text in upstream's files, so it rots silently when
+# upstream edits them. This proves it still applies against the current
+# release AND the default branch, so a breaking change surfaces before it
+# reaches a release rather than at 6am on build day.
+on:
+    push:
+        branches: [main]
+    pull_request:
+    schedule:
+        - cron: "0 5 * * *"
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+env:
+    UPSTREAM: rivenmedia/riven
+
+jobs:
+    apply:
+        name: Apply to ${{ matrix.ref }}
+        runs-on: ubuntu-latest
+        strategy:
+            fail-fast: false
+            matrix:
+                ref: [release, main]
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  path: patchsrc
+
+            - name: Resolve the ref
+              id: pick
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  set -euo pipefail
+                  if [ "${{ matrix.ref }}" = "release" ]; then
+                    REF=$(gh api "repos/${UPSTREAM}/releases" --jq 'map(select(.draft == false)) | .[0].tag_name')
+                  else
+                    REF=$(gh api "repos/${UPSTREAM}" --jq .default_branch)
+                  fi
+                  echo "ref=$REF" >> "$GITHUB_OUTPUT"
+                  echo "resolved to $REF"
+
+            - uses: actions/checkout@v4
+              with:
+                  repository: ${{ env.UPSTREAM }}
+                  ref: ${{ steps.pick.outputs.ref }}
+                  path: upstream
+
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 22
+            - uses: actions/setup-python@v5
+              with:
+                  python-version: "3.13"
+
+            - name: Apply
+              working-directory: upstream
+              run: node ../patchsrc/patch/apply.mjs
+
+            - name: The patch must be idempotent
+              working-directory: upstream
+              run: |
+                  set -euo pipefail
+                  node ../patchsrc/patch/apply.mjs | tee second.log
+                  # Re-applying must change nothing. "copied" is expected --
+                  # the provider file is overwritten every run by design --
+                  # but any "patched" line means an edit is not detecting its
+                  # own previous application and will duplicate itself.
+                  if grep -q "^  patched " second.log; then
+                    echo "::error::apply.mjs is not idempotent"
+                    exit 1
+                  fi
+                  rm second.log
+
+            - name: It must actually import
+              working-directory: upstream
+              run: |
+                  set -euo pipefail
+                  python3 -m py_compile \
+                    src/program/services/downloaders/torbox.py \
+                    src/program/settings/models.py \
+                    src/program/services/downloaders/__init__.py
+
+                  # TorBox must be a real field on DownloadersModel, not just a
+                  # class sitting unreferenced in the file. The settings form
+                  # is generated from this schema, so a missing field means the
+                  # provider is unconfigurable no matter what else applied.
+                  python3 - <<'PY'
+                  import ast
+                  tree = ast.parse(open("src/program/settings/models.py").read())
+                  fields = []
+                  for node in ast.walk(tree):
+                      if isinstance(node, ast.ClassDef) and node.name == "DownloadersModel":
+                          fields = [t.target.id for t in node.body if isinstance(t, ast.AnnAssign)]
+                  assert "torbox" in fields, f"torbox missing from DownloadersModel: {fields}"
+                  print("DownloadersModel carries torbox:", fields)
+                  PY
+
+                  grep -q "TorBoxDownloader: TorBoxDownloader()" src/program/services/downloaders/__init__.py
+                  echo "verified"

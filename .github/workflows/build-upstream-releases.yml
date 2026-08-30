@@ -1,0 +1,226 @@
+name: Build patched upstream releases
+
+# Upstream cuts releases on its own schedule and has no way to notify this
+# repo, so this polls. Also runnable by hand, and on any change to the patch
+# itself -- a patch edit has to be provable against the current release
+# without waiting for the next one.
+on:
+    schedule:
+        - cron: "0 6 * * *"
+    workflow_dispatch:
+        inputs:
+            tag:
+                description: "Upstream tag to build (default: the latest release)"
+                required: false
+            force:
+                description: "Rebuild even if this tag was already published"
+                type: boolean
+                default: false
+    push:
+        branches: [main]
+        paths:
+            - "patch/**"
+            - ".github/workflows/build-upstream-releases.yml"
+
+concurrency:
+    group: ${{ github.workflow }}
+    cancel-in-progress: false
+
+permissions:
+    contents: read
+    packages: write
+
+env:
+    UPSTREAM: rivenmedia/riven
+    IMAGE: ghcr.io/${{ github.repository_owner }}/riven-jellyfin
+
+jobs:
+    resolve:
+        name: Which upstream release
+        runs-on: ubuntu-latest
+        outputs:
+            tag: ${{ steps.pick.outputs.tag }}
+            needed: ${{ steps.pick.outputs.needed }}
+        steps:
+            - name: Pick the tag and check whether it is already published
+              id: pick
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  set -euo pipefail
+
+                  TAG="${{ inputs.tag }}"
+                  if [ -z "$TAG" ]; then
+                    # The list endpoint rather than releases/latest, which
+                    # excludes prereleases. Riven's active line has been
+                    # prereleases before, and a silent fall back to a
+                    # months-old tag whose layout the patch does not fit cost
+                    # real time on the frontend fork. Newest-first; drafts
+                    # skipped because they have no buildable tag.
+                    TAG=$(gh api "repos/${UPSTREAM}/releases" \
+                            --jq 'map(select(.draft == false)) | .[0].tag_name')
+                  fi
+                  echo "upstream tag: $TAG"
+                  echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+                  # Skip work already done. A daily poll that rebuilt the same
+                  # release every morning would republish an identical image
+                  # and churn the tag for no reason.
+                  #
+                  # A PUSH is the exception, and getting this wrong is silent.
+                  # This workflow also triggers on changes to patch/**, and the
+                  # whole point of that trigger is to rebuild the CURRENT
+                  # release with the new patch. The published-tag check would
+                  # otherwise skip it every time -- upstream has not moved, so
+                  # the tag exists -- and the change would sit unbuilt while
+                  # the workflow reported success. Observed exactly that way:
+                  # a patch commit went green and the deployed image was
+                  # unchanged.
+                  if [ "${{ github.event_name }}" = "push" ]; then
+                    echo "patch changed; rebuilding ${TAG} regardless of publication"
+                    echo "needed=true" >> "$GITHUB_OUTPUT"
+                  elif [ "${{ inputs.force }}" = "true" ]; then
+                    echo "needed=true" >> "$GITHUB_OUTPUT"
+                  elif docker manifest inspect "${IMAGE}:${TAG}" >/dev/null 2>&1; then
+                    echo "already published; nothing to do"
+                    echo "needed=false" >> "$GITHUB_OUTPUT"
+                  else
+                    echo "needed=true" >> "$GITHUB_OUTPUT"
+                  fi
+
+    build:
+        name: ${{ matrix.arch }}
+        needs: resolve
+        if: needs.resolve.outputs.needed == 'true'
+        strategy:
+            fail-fast: true
+            matrix:
+                include:
+                    - platform: linux/amd64
+                      runner: ubuntu-latest
+                      arch: amd64
+                    - platform: linux/arm64
+                      runner: ubuntu-24.04-arm
+                      arch: arm64
+        runs-on: ${{ matrix.runner }}
+        steps:
+            - name: Check out this repo (the patch)
+              uses: actions/checkout@v4
+              with:
+                  path: patchsrc
+
+            - name: Check out upstream at ${{ needs.resolve.outputs.tag }}
+              uses: actions/checkout@v4
+              with:
+                  repository: ${{ env.UPSTREAM }}
+                  ref: ${{ needs.resolve.outputs.tag }}
+                  path: upstream
+
+            # Fails the build rather than publishing an unpatched image. An
+            # image that silently lacks the integration is worse than no image:
+            # a Jellyfin client would sit on a spinner with nothing to explain
+            # why.
+            - name: Apply the Jellyfin patch
+              working-directory: upstream
+              run: node ../patchsrc/patch/apply.mjs
+
+            - name: Verify the patch actually landed
+              working-directory: upstream
+              run: |
+                  set -euo pipefail
+                  test -f src/program/services/downloaders/torbox.py
+                  grep -q "class TorBoxModel" src/program/settings/models.py
+                  # The registry entry is the one that actually makes TorBox
+                  # selectable. Without it the settings field exists, the UI
+                  # renders it, a key can be saved -- and nothing ever
+                  # downloads, which is precisely the bug this repo fixes.
+                  grep -q "TorBoxDownloader: TorBoxDownloader()" src/program/services/downloaders/__init__.py
+                  python3 -m py_compile \
+                    src/program/services/downloaders/torbox.py \
+                    src/program/settings/models.py \
+                    src/program/services/downloaders/__init__.py
+                  echo "patch verified"
+
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@v3
+
+            - name: Log in to GitHub Container Registry
+              uses: docker/login-action@v3
+              with:
+                  registry: ghcr.io
+                  username: ${{ github.repository_owner }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Build and push by digest
+              id: build
+              uses: docker/build-push-action@v6
+              with:
+                  context: upstream
+                  file: upstream/Dockerfile
+                  platforms: ${{ matrix.platform }}
+                  provenance: false
+                  outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+                  # Scoped per arch; a shared scope makes the two runners evict
+                  # each other's layers on every build.
+                  cache-from: type=gha,scope=${{ matrix.arch }}
+                  cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+            - name: Export digest
+              run: |
+                  mkdir -p /tmp/digests
+                  # The sha256: prefix is stripped because the digest becomes a
+                  # FILENAME here, and the upload-artifact action rejects a
+                  # colon in a path. The publish job puts the prefix back.
+                  digest="${{ steps.build.outputs.digest }}"
+                  touch "/tmp/digests/${digest#sha256:}"
+
+            - name: Upload digest
+              uses: actions/upload-artifact@v4
+              with:
+                  name: digest-${{ matrix.arch }}
+                  path: /tmp/digests/*
+                  if-no-files-found: error
+                  retention-days: 1
+
+    publish:
+        name: Publish manifest
+        needs: [resolve, build]
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/download-artifact@v4
+              with:
+                  path: /tmp/digests
+                  pattern: digest-*
+                  merge-multiple: true
+
+            - uses: docker/setup-buildx-action@v3
+
+            - uses: docker/login-action@v3
+              with:
+                  registry: ghcr.io
+                  username: ${{ github.repository_owner }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            # Mirrors upstream's own tagging: the release tag, the bare
+            # version, and `latest`. Someone pinning a version upstream can
+            # pin the same string here.
+            - name: Docker metadata
+              id: meta
+              uses: docker/metadata-action@v5
+              with:
+                  images: ${{ env.IMAGE }}
+                  flavor: latest=true
+                  tags: |
+                      type=raw,value=${{ needs.resolve.outputs.tag }}
+                      type=semver,pattern={{version}},value=${{ needs.resolve.outputs.tag }}
+                      type=semver,pattern={{major}}.{{minor}},value=${{ needs.resolve.outputs.tag }}
+
+            - name: Create manifest list and push
+              working-directory: /tmp/digests
+              run: |
+                  docker buildx imagetools create \
+                    $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+                    $(printf '${{ env.IMAGE }}@sha256:%s ' *)
+
+            - name: Inspect
+              run: docker buildx imagetools inspect "${{ env.IMAGE }}:${{ needs.resolve.outputs.tag }}"
