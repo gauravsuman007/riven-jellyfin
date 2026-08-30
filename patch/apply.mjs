@@ -60,11 +60,16 @@ function edit(relative, describe, transform) {
 
 // --- 1. the provider itself ------------------------------------------------
 
-for (const name of ["torbox.py", "uncached.py"]) {
-    const target = join(upstream, "src/program/services/downloaders", name);
+for (const relative of [
+    "src/program/services/downloaders/torbox.py",
+    "src/program/services/downloaders/uncached.py",
+    // Not a TorBox file, but the same kind of gap: see section 6.
+    "src/program/services/streaming/playback_url.py"
+]) {
+    const target = join(upstream, relative);
     mkdirSync(dirname(target), { recursive: true });
-    copyFileSync(join(here, "files/src/program/services/downloaders", name), target);
-    console.log(`  copied src/program/services/downloaders/${name}`);
+    copyFileSync(join(here, "files", relative), target);
+    console.log(`  copied ${relative}`);
 }
 
 // --- 2. settings -----------------------------------------------------------
@@ -343,5 +348,156 @@ edit("src/program/services/downloaders/__init__.py", "restored the missing add_t
 
     return source.replace(anchor, replacement);
 });
+
+
+// --- 6. refresh the provider link before streaming -------------------------
+
+edit("src/routers/secure/stream.py", "re-mint a spent provider link instead of 502ing", (source, bad) => {
+    if (source.includes("playback_url")) return null;
+
+    /*
+        THE BUG, reproduced on a live install: playing a title that had been
+        sitting in the library for a few hours returned a flat 502, and the
+        log said
+
+            Failed to connect to upstream: Client error '400 Bad Request'
+            for url 'https://<cdn>/dld/<id>?token=<token>'
+
+        `MediaEntry.url` is `unrestricted_url or download_url` -- a CDN link
+        minted once, at download time, and never refreshed. Debrid links
+        expire; TorBox in particular answers a spent one with 400. RivenVFS
+        refreshes as it reads (MediaStream._refresh_download_url), so the
+        mounted file keeps working and only the HTTP endpoints break, which
+        is why this presents as "the player is broken" rather than "the
+        library is broken".
+
+        The fix is one retry against a freshly minted URL, which is what the
+        VFS has always done. See program/services/streaming/playback_url.py
+        for why it does not reuse VFSDatabase.refresh_unrestricted_url: that
+        one blacklists the item when unrestricting fails, so a provider
+        hiccup during PLAYBACK would silently un-complete a downloaded title.
+    */
+    const importAnchor = "from program.services.streaming.media_stream import PROXY_REQUIRED_PROVIDERS";
+
+    if (!source.includes(importAnchor)) bad("could not find the media_stream import");
+
+    source = source.replace(
+        importAnchor,
+        `${importAnchor}\nfrom program.services.streaming import playback_url`
+    );
+
+    const bodyAnchor = `    url, provider, filename = _get_media_info(item_id)
+
+    client = _get_client(provider)
+    forward_headers = _build_forward_headers(request)
+
+    upstream_response: httpx.Response | None = None
+    try:
+        req = client.build_request("GET", url, headers=forward_headers)
+
+        try:
+            upstream_response = await client.send(req, stream=True)
+        except Exception as e:
+            logger.error(f"Failed to connect to upstream: {e}")
+            raise HTTPException(status_code=502, detail="Upstream connection failed")
+
+        if upstream_response.status_code >= 400:
+            await _handle_upstream_error(upstream_response)
+
+        response_headers = _extract_response_headers(upstream_response, filename)`;
+
+    if (!source.includes(bodyAnchor)) bad("could not find stream_file's upstream request");
+
+    source = source.replace(
+        bodyAnchor,
+        `    media = playback_url.resolve(item_id)
+    forward_headers = _build_forward_headers(request)
+
+    upstream_response: httpx.Response | None = None
+    try:
+        for attempt in (0, 1):
+            client = _get_client(media.provider)
+            req = client.build_request("GET", media.url, headers=forward_headers)
+
+            try:
+                upstream_response = await client.send(req, stream=True)
+            except httpx.HTTPStatusError as e:
+                # AsyncClient raises on 4xx/5xx through an event hook rather
+                # than returning the response, so a rejection arrives here and
+                # never reaches the status check below.
+                status_code = e.response.status_code
+                await e.response.aclose()
+                upstream_response = None
+
+                if attempt == 0 and status_code < 500:
+                    # 400/401/403/404/410 from a debrid CDN all mean the same
+                    # thing in practice: this link is spent. Mint a new one.
+                    logger.debug(
+                        f"Upstream rejected the stored link for item {item_id} "
+                        f"({status_code}); re-minting"
+                    )
+                    media = playback_url.resolve(item_id, force=True)
+                    continue
+
+                raise HTTPException(
+                    status_code=502, detail=f"Upstream error: {status_code}"
+                )
+            except Exception as e:
+                # The message can embed the provider URL, token and all.
+                logger.error(
+                    f"Failed to connect to upstream "
+                    f"{playback_url.redact(media.url)}: {playback_url.redact(str(e))}"
+                )
+                raise HTTPException(status_code=502, detail="Upstream connection failed")
+
+            if upstream_response.status_code >= 400:
+                # The same case again, for a client configured without the
+                # raising hook.
+                status_code = upstream_response.status_code
+
+                if attempt == 0 and status_code < 500:
+                    await upstream_response.aclose()
+                    upstream_response = None
+                    media = playback_url.resolve(item_id, force=True)
+                    continue
+
+                await _handle_upstream_error(upstream_response)
+
+            break
+
+        assert upstream_response is not None
+
+        response_headers = _extract_response_headers(upstream_response, media.filename)`
+    );
+
+    /*
+        The rest of the function still refers to the old locals. Only two
+        remain, both in the MIME-type guess and neither ambiguous.
+    */
+    const mimeAnchor = "        guessed_type, _ = mimetypes.guess_type(filename)";
+
+    if (!source.includes(mimeAnchor)) bad("could not find the MIME-type guess");
+
+    source = source.replace(mimeAnchor, "        guessed_type, _ = mimetypes.guess_type(media.filename)");
+
+    /*
+        The two HLS routes hand the URL to ffmpeg, which gets exactly one
+        attempt and cannot come back and ask for a fresh link -- so those
+        verify the stored URL up front (one ranged GET of a single byte)
+        instead of retrying. A spent link surfaced there as "Transcoding
+        failed" with no indication that the cause was an expired token.
+    */
+    for (const call of [
+        "    url, _provider, _filename = _get_media_info(item_id)",
+        "    url, _, _ = _get_media_info(item_id)"
+    ]) {
+        if (!source.includes(call)) bad(`could not find the HLS call site: ${call.trim()}`);
+
+        source = source.replace(call, "    url = playback_url.resolve(item_id, check=True).url");
+    }
+
+    return source;
+});
+
 
 console.log("\npatch applied.\n");
