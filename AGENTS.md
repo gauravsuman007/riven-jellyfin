@@ -56,6 +56,16 @@ Its frontend is `riven-frontend`, built from `riven-frontend-jellyfin`. Name
 services explicitly: a bare `up -d` also recreates `riven-upstream-db`, which
 an app deploy has no reason to touch.
 
+The compose file lives only on the server (this repo ships a patch, not a
+deployment). One thing in it is easy to lose on a rewrite:
+`RIVEN_FILESYSTEM_CACHE_DIR=/riven/cache` with a matching `./cache` bind. The
+default is `/dev/shm/riven-cache` — a tmpfs, so every cached chunk is resident
+RAM charged to the container, measured at 491 MiB of `riven`'s 672 MiB, on a
+host whose swap was fully consumed. It is also capped by `shm_size` at 1 GiB
+while `cache_max_size_mb` is 10 GiB, so the cache believes it has ten times the
+room it has. Pin the path from the environment rather than the UI, or the
+setting and the mount can drift apart.
+
 ## Traps that have cost time
 
 - **`UserInfo` must accept `"torbox"`.** Upstream types the provider as a
