@@ -533,8 +533,13 @@ edit("src/program/settings/models.py", "added the local download path settings",
     # not appear -- because writing large files to an unconfigured path is a
     # worse default than not offering it. Settable as
     # RIVEN_FILESYSTEM_LOCAL_DOWNLOAD_PATH like any other setting.
-    local_download_path: Path | None = Field(
-        default=None,
+    # A str defaulting to "", NOT \`Path | None\` defaulting to None: the
+    # settings file is written with exclude_none=True, so a None default is
+    # never serialized, and check_environment only walks keys already present
+    # in the file -- so RIVEN_FILESYSTEM_LOCAL_DOWNLOAD_PATH would silently do
+    # nothing. Confirmed live before this was changed.
+    local_download_path: str = Field(
+        default="",
         description=(
             "Directory on this server where kept titles are copied. Leave "
             "empty to disable keeping titles on disk. Must be writable by "
