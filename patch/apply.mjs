@@ -64,7 +64,12 @@ for (const relative of [
     "src/program/services/downloaders/torbox.py",
     "src/program/services/downloaders/uncached.py",
     // Not a TorBox file, but the same kind of gap: see section 6.
-    "src/program/services/streaming/playback_url.py"
+    "src/program/services/streaming/playback_url.py",
+    // "Keep on disk" -- see section 7. Whole files, no upstream equivalent.
+    "src/program/media/local_copy.py",
+    "src/program/services/localsync/__init__.py",
+    "src/routers/secure/keep.py",
+    "src/alembic/versions/20260909_1200_b7d4e5f61c92_local_copy.py"
 ]) {
     const target = join(upstream, relative);
     mkdirSync(dirname(target), { recursive: true });
@@ -498,6 +503,180 @@ edit("src/routers/secure/stream.py", "re-mint a spent provider link instead of 5
 
     return source;
 });
+
+// --- 7. "Keep on disk" -----------------------------------------------------
+//
+// Everything RivenVFS presents is fetched from the debrid provider on demand
+// and stored nowhere. That is the design, and it has one consequence: lose the
+// provider -- account expires, torrent is dropped, connection is down -- and
+// the library is gone. This adds a per-title copy onto local disk, tracked so
+// the UI can show it as Queued / Syncing NN% / On disk.
+//
+// The model, service, router and migration are whole new files copied in
+// section 1. What follows is only the wiring upstream cannot know about.
+
+edit("src/program/settings/models.py", "added the local download path settings", (source, bad) => {
+    if (source.includes("local_download_path")) return null;
+
+    const anchor = `    cache_dir: Path = Field(
+        default=Path("/dev/shm/riven-cache"),
+        description="Directory for caching downloaded chunks",
+    )
+`;
+
+    if (!source.includes(anchor)) bad("could not find FilesystemModel.cache_dir");
+
+    return source.replace(
+        anchor,
+        `${anchor}
+    # "Keep on disk". Empty disables the feature outright -- the button does
+    # not appear -- because writing large files to an unconfigured path is a
+    # worse default than not offering it. Settable as
+    # RIVEN_FILESYSTEM_LOCAL_DOWNLOAD_PATH like any other setting.
+    local_download_path: Path | None = Field(
+        default=None,
+        description=(
+            "Directory on this server where kept titles are copied. Leave "
+            "empty to disable keeping titles on disk. Must be writable by "
+            "the container and have room for the files you keep."
+        ),
+    )
+    local_download_concurrency: int = Field(
+        default=1,
+        ge=1,
+        le=8,
+        description=(
+            "How many titles to copy to local disk at once. Each copy is a "
+            "sustained read from the debrid provider, so more is not faster "
+            "on a limited connection and risks the provider's rate limits."
+        ),
+    )
+`
+    );
+});
+
+edit("src/program/media/__init__.py", "exported LocalCopy", (source, bad) => {
+    if (source.includes("LocalCopy")) return null;
+
+    const anchor = "from .filesystem_entry import FilesystemEntry";
+
+    if (!source.includes(anchor)) bad("could not find the FilesystemEntry import");
+
+    source = source.replace(
+        anchor,
+        `${anchor}\nfrom .local_copy import LocalCopy, LocalCopyState`
+    );
+
+    const listed = '    "FilesystemEntry",\n';
+
+    if (!source.includes(listed)) bad("could not find FilesystemEntry in __all__");
+
+    return source.replace(listed, `${listed}    "LocalCopy",\n    "LocalCopyState",\n`);
+});
+
+edit("src/program/db/base_model.py", "registered LocalCopy with Base.metadata", (source, bad) => {
+    if (source.includes("LocalCopy")) return null;
+
+    // Without this the table is invisible to Alembic's autogenerate and to
+    // create_all -- the migration would be the only thing that knows it.
+    const anchor = "        FilesystemEntry,  # pyright: ignore[reportUnusedImport]\n";
+
+    if (!source.includes(anchor)) bad("could not find the FilesystemEntry metadata import");
+
+    return source.replace(
+        anchor,
+        `${anchor}        LocalCopy,  # pyright: ignore[reportUnusedImport]\n`
+    );
+});
+
+edit("src/program/media/item.py", "added MediaItem.local_copy", (source, bad) => {
+    if (source.includes("local_copy")) return null;
+
+    const typeAnchor = "    from program.media.filesystem_entry import FilesystemEntry\n";
+
+    if (!source.includes(typeAnchor)) bad("could not find the TYPE_CHECKING import");
+
+    source = source.replace(
+        typeAnchor,
+        `${typeAnchor}    from program.media.local_copy import LocalCopy\n`
+    );
+
+    const anchor = "    failed_attempts: Mapped[int] = mapped_column(sqlalchemy.Integer, default=0)\n";
+
+    if (!source.includes(anchor)) bad("could not find failed_attempts on MediaItem");
+
+    return source.replace(
+        anchor,
+        `    # The local-disk copy of this title, if one has been asked for. One
+    # per item: "keep" is a property of the title, not of a release.
+    local_copy: Mapped["LocalCopy | None"] = relationship(
+        "LocalCopy",
+        back_populates="media_item",
+        lazy="selectin",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+${anchor}`
+    );
+});
+
+edit("src/routers/__init__.py", "mounted the keep router", (source, bad) => {
+    if (source.includes("keep_router")) return null;
+
+    const importAnchor = "from routers.secure.items import router as items_router";
+    const mountAnchor =
+        "app_router.include_router(items_router, dependencies=[Depends(resolve_api_key)])";
+
+    if (!source.includes(importAnchor)) bad("could not find the items router import");
+    if (!source.includes(mountAnchor)) bad("could not find where items_router is mounted");
+
+    source = source.replace(
+        importAnchor,
+        `${importAnchor}\nfrom routers.secure.keep import router as keep_router`
+    );
+
+    return source.replace(
+        mountAnchor,
+        `${mountAnchor}\napp_router.include_router(keep_router, dependencies=[Depends(resolve_api_key)])`
+    );
+});
+
+edit("src/program/program.py", "started and stopped the local sync service", (source, bad) => {
+    if (source.includes("local_sync")) return null;
+
+    const importAnchor = "from .services.filesystem import FilesystemService";
+
+    if (!source.includes(importAnchor)) bad("could not find the FilesystemService import");
+
+    source = source.replace(
+        importAnchor,
+        `${importAnchor}\nfrom .services.localsync import local_sync`
+    );
+
+    const startAnchor = "        self.scheduler_manager.start()\n\n        super().start()\n";
+
+    if (!source.includes(startAnchor)) bad("could not find the scheduler start");
+
+    source = source.replace(
+        startAnchor,
+        `        self.scheduler_manager.start()
+
+        # Copies of kept titles run outside the event pipeline: they are long,
+        # bandwidth-bound and must survive a restart mid-file, none of which
+        # the per-item event loop is shaped for.
+        local_sync().start()
+
+        super().start()
+`
+    );
+
+    const stopAnchor = "        if self.services:\n            self.services.filesystem.close()\n";
+
+    if (!source.includes(stopAnchor)) bad("could not find where filesystem is closed on stop");
+
+    return source.replace(stopAnchor, `        local_sync().stop()\n\n${stopAnchor}`);
+});
+
 
 
 console.log("\npatch applied.\n");

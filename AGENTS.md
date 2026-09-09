@@ -66,6 +66,24 @@ while `cache_max_size_mb` is 10 GiB, so the cache believes it has ten times the
 room it has. Pin the path from the environment rather than the UI, or the
 setting and the mount can drift apart.
 
+## "Keep on disk" (section 7 of the patch)
+
+A library title exists only in the debrid account; RivenVFS fetches every byte
+on demand and stores none. `POST /api/v1/keep/{id}` copies one title's active
+file to `filesystem.local_download_path` and tracks it in a `LocalCopy` row --
+Queued / Syncing / OnDisk / Failed, with bytes so far for the progress the
+button shows. `DELETE` the same path stops it and removes the file.
+
+The copy reads through the VFS mount rather than talking to the provider: the
+VFS already re-mints spent links, honours VPN routing, and shares its chunk
+cache with playback, and a second download path would have to reimplement all
+three. It is resumable (`.part`, continued on restart), pre-flights free space,
+and prunes the title directory when the last file is removed.
+
+The server compose needs a bind for the path and
+`RIVEN_FILESYSTEM_LOCAL_DOWNLOAD_PATH` pointing at it; empty disables the
+feature and the frontend hides the button.
+
 ## Traps that have cost time
 
 - **`UserInfo` must accept `"torbox"`.** Upstream types the provider as a

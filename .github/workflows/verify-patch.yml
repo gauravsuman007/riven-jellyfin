@@ -103,7 +103,34 @@ jobs:
                   python3 -m py_compile \
                     src/program/services/downloaders/torbox.py \
                     src/program/settings/models.py \
-                    src/program/services/downloaders/__init__.py
+                    src/program/services/downloaders/__init__.py \
+                    src/program/media/local_copy.py \
+                    src/program/media/item.py \
+                    src/program/services/localsync/__init__.py \
+                    src/routers/secure/keep.py \
+                    src/routers/__init__.py \
+                    src/program/program.py
+
+                  # The keep migration must chain onto upstream's head rather
+                  # than forking it. Two heads make `alembic upgrade head`
+                  # ambiguous and the container fails to start.
+                  python3 - <<'PY2'
+                  import pathlib, re
+
+                  revisions, downs = {}, {}
+
+                  for path in pathlib.Path("src/alembic/versions").glob("*.py"):
+                      text = path.read_text()
+                      rev = re.search(r'revision: str = "([^"]+)"', text)
+                      down = re.search(r'down_revision: Union\[str, None\] = "([^"]+)"', text)
+                      if rev:
+                          revisions[rev.group(1)] = path.name
+                          downs[rev.group(1)] = down.group(1) if down else None
+
+                  heads = set(revisions) - {d for d in downs.values() if d}
+                  assert heads == {"b7d4e5f61c92"}, f"expected one head (the keep migration), got {heads}"
+                  print("single alembic head:", heads)
+                  PY2
 
                   # TorBox must be a real field on DownloadersModel, not just a
                   # class sitting unreferenced in the file. The settings form
