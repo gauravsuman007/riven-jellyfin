@@ -28,6 +28,30 @@ Two consequences worth internalising before editing:
 
 Run it by hand against a checkout: `node patch/apply.mjs ../riven-upstream`.
 
+## The two halves of the spent-link bug
+
+Debrid links expire, and **TorBox reports a spent one as `400 Bad Request`**
+— not 404, not 410. Two separate code paths have to know that, and fixing
+only one of them is how this bit twice:
+
+- **Section 6** covers the HTTP stream endpoints (`routers/secure/stream.py`).
+- **Section 8** covers the VFS read path (`MediaStream`), whose refresh is
+  reached from a single status-code branch that upstream lists as
+  `NOT_FOUND, GONE, SERVICE_UNAVAILABLE`. A 400 fell to the catch-all, which
+  raises without refreshing *or* retrying.
+
+Section 6's own comment asserted the VFS "keeps working" because it refreshes
+as it reads. It didn't, and the symptom was total: every title read zero
+bytes and Jellyfin's ffmpeg exited 251 on all of them. **A restart cannot
+help** — the dead URL is persisted on the `MediaEntry`, so the same link with
+the same token comes back after a full reboot. That is worth knowing before
+diagnosing, because "I restarted and it's still broken" reads like a much
+deeper fault than one missing member of a tuple.
+
+401 and 403 stay out of that set deliberately: those mean the credential is
+wrong or the account is being throttled, and re-minting hammers a provider
+that is already refusing.
+
 ## Testing and CI
 
 - `python3 test/test_uncached.py` — runs against the patch's own module with

@@ -683,5 +683,69 @@ edit("src/program/program.py", "started and stopped the local sync service", (so
 });
 
 
+// --- 8. let the VFS recover from a spent link too --------------------------
+
+edit("src/program/services/streaming/media_stream.py", "treat HTTP 400 as a spent link, not an unknown fault", (source, bad) => {
+    // Keyed on what this edit INSERTS. A guard matching something upstream
+    // already contains passes on a wholly unpatched checkout, which is how
+    // a patch silently does nothing.
+    if (source.includes("HTTPStatus.BAD_REQUEST")) return null;
+
+    /*
+        THE BUG, and it is the second half of section 6.
+
+        That section fixed the HTTP stream endpoints and said, in its own
+        comment, that the mounted file kept working because "RivenVFS
+        refreshes as it reads (MediaStream._refresh_download_url)". It does
+        not. That refresh is reached from exactly one status-code branch:
+
+            elif status_code in (NOT_FOUND, GONE, SERVICE_UNAVAILABLE):
+
+        and TorBox answers a spent link with 400 Bad Request. So a 400 fell
+        through to the catch-all, which raises without refreshing and
+        without retrying:
+
+            else:
+                logger.warning(f"Unexpected HTTP {status_code}")
+                raise DebridServiceException("Unexpected error connecting to stream", ...)
+
+        Measured on a live install: every title in the library read zero
+        bytes, Jellyfin's ffmpeg exited 251 on all of them, and the log said
+
+            media_stream - Unexpected HTTP 400
+            rivenvfs.read - DebridServiceException: torbox: Unexpected error
+
+        Restarting fixed nothing and could not: the dead URL is persisted on
+        the MediaEntry, so the same link with the same token came back after
+        a full reboot of the host. Meanwhile the provider was entirely
+        healthy -- the account was active, the torrent was cached, and a
+        link minted by hand returned 206 with real bytes immediately.
+
+        One line of set membership stood between a working library and a
+        library that reads zero.
+
+        WHY 400 AND NOT THE WHOLE 4xx RANGE
+        401 and 403 are deliberately left out, and upstream is right to
+        exclude them: those mean the CREDENTIAL is wrong or the account is
+        being rate limited, and re-minting hammers a provider that is
+        already refusing. 400 is different -- the request was well formed
+        and the link is simply spent, which is precisely the case a fresh
+        link fixes. A refresh that produces the same URL returns False
+        anyway, so a genuinely malformed request still fails on the first
+        attempt rather than looping.
+    */
+    const anchor =
+        "                elif status_code in (HTTPStatus.NOT_FOUND, HTTPStatus.GONE, HTTPStatus.SERVICE_UNAVAILABLE):";
+
+    if (!source.includes(anchor)) {
+        bad("could not find the status-code branch that refreshes a stale URL");
+    }
+
+    return source.replace(
+        anchor,
+        "                elif status_code in (HTTPStatus.BAD_REQUEST, HTTPStatus.NOT_FOUND, HTTPStatus.GONE, HTTPStatus.SERVICE_UNAVAILABLE):"
+    );
+});
+
 
 console.log("\npatch applied.\n");
